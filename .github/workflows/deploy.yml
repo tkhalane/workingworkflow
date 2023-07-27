@@ -1,0 +1,88 @@
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        required: true
+        description: "Service name to deploy"
+        type: string
+      environment:
+        required: true
+        default: staging
+        description: "Environment to deploy service to"
+        type: string
+      port_payload:
+        required: true
+        description: "Port's payload, including details for who triggered the action and general context (blueprint, run id, etc...)"
+        type: string
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: docker.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  push_to_registry:
+    name: Push Docker image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Check out the repo
+        run: docker build . --file Dockerfile --tag ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v2
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: "{{defaultContext}}"
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Update Image Version in the related HelmChart values.yaml
+        uses: fjogeleit/yaml-update-action@main
+        with:
+          valueFile: "helm/values.yaml"
+          propertyPath: "image.tag"
+          value: "${{ github.sha }}"
+          branch: main
+          targetBranch: main
+          createPR: false
+          message: "Update Image Version to ${{ github.sha }}"
+
+  report-deployment:
+    name: Report new deployment Entity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract SHA short
+        run: echo "SHA_SHORT=${GITHUB_SHA:0:7}" >> $GITHUB_ENV
+      - name: "Report deployment Entity to port 🚢"
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          identifier: ${{ inputs.service }}-${{ inputs.environment }}-${{ env.SHA_SHORT }}
+          blueprint: deployment
+          properties: |
+            {
+               "jobUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+               "deployingUser": "${{ github.actor }}",
+               "imageTag": "latest",
+               "commitSha": "${{ env.SHA_SHORT }}"
+            }
+          runId: "${{fromJson(inputs.port_payload).context.runId}}"
